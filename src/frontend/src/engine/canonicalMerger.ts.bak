@@ -1,0 +1,749 @@
+import type { C16Result } from "./c16Engine";
+import type { Context7dResult } from "./context7dEngine";
+import type { ExecutionResult } from "./executionResolver";
+import type { MTFResult } from "./mtfEngine";
+import type {
+  BoardSection,
+  CanonicalSymbolState,
+  Phase,
+  RuntimeMode,
+  Tier,
+  UserStatus,
+} from "./types";
+import type { RawSymbolData } from "./types";
+
+interface HysteresisBuffer {
+  statusHistory: UserStatus[];
+  boardSectionHistory: BoardSection[];
+  lastRecentChangeText: string;
+  lastScoreForDelta: number;
+  // Track whether anchor was already reported so we don't repeat it
+  anchorReported: boolean;
+}
+
+// Per-symbol hysteresis buffers
+const hysteresisMap = new Map<string, HysteresisBuffer>();
+
+function getHysteresis(symbol: string): HysteresisBuffer {
+  if (!hysteresisMap.has(symbol)) {
+    hysteresisMap.set(symbol, {
+      statusHistory: [],
+      boardSectionHistory: [],
+      lastRecentChangeText: "No meaningful change",
+      lastScoreForDelta: 0,
+      anchorReported: false,
+    });
+  }
+  return hysteresisMap.get(symbol)!;
+}
+
+const STATUS_ORDER: UserStatus[] = [
+  "DIRECTION_UNCLEAR",
+  "EARLY_CANDIDATE",
+  "WORTH_WATCHING",
+  "FORMING_SETUP",
+  "ACTIVE_CANDIDATE",
+  "ARMED",
+  "READY",
+  "ENTERED",
+  "MANAGING",
+  "EXITED",
+  "CANCELLED",
+];
+
+function statusIndex(s: UserStatus): number {
+  return STATUS_ORDER.indexOf(s);
+}
+
+// -----------------------------------------------------------------------
+// STATUS PROMOTION — strict MTF-hierarchy-aware cap
+// -----------------------------------------------------------------------
+function resolveMTFStatusCap(mtf: MTFResult, tier: Tier): UserStatus | null {
+  const layerBCap: UserStatus = "FORMING_SETUP";
+
+  // 4H NEUTRAL — no directional structure at all
+  if (mtf.bias4h === "NEUTRAL") {
+    return "WORTH_WATCHING";
+  }
+
+  // 4H directional but 1H unconfirmed
+  if (mtf.confirm1h === "UNCONFIRMED") {
+    if (tier === "LAYER_B") return layerBCap;
+    return "FORMING_SETUP";
+  }
+
+  // 4H + 1H both directional but lower TFs both weak
+  const both15m5mWeak = mtf.growth15m < 25 && mtf.growth5m < 25;
+  if (both15m5mWeak) {
+    if (tier === "LAYER_B") return layerBCap;
+    return "FORMING_SETUP";
+  }
+
+  // Layer_B hard cap even with good MTF: never ARMED or above
+  if (tier === "LAYER_B") {
+    return layerBCap;
+  }
+
+  // All MTF conditions pass — no MTF cap imposed; C16 logic drives
+  return null;
+}
+
+// -----------------------------------------------------------------------
+// SAFE PHASE — caps the user-visible phase label to what MTF actually allows.
+//
+// TRIGGERABLE is an internal C16 phase. It must not appear on user-facing
+// surfaces when MTF structure is incomplete.
+//
+// Rules:
+//   4H NEUTRAL → TRIGGERABLE/PRESSURIZED → BUILDING
+//   4H directional + 1H UNCONFIRMED → TRIGGERABLE → BUILDING
+//     (PRESSURIZED acceptable: 4H is real, just 1H pending)
+//
+// Raw c16.phase is preserved for internal engine use.
+// All user-facing display must use ui.safePhase.
+// -----------------------------------------------------------------------
+function resolveSafePhase(c16Phase: Phase, mtf: MTFResult): Phase {
+  if (mtf.bias4h === "NEUTRAL") {
+    if (c16Phase === "TRIGGERABLE" || c16Phase === "PRESSURIZED") {
+      return "BUILDING";
+    }
+    return c16Phase;
+  }
+  if (mtf.confirm1h === "UNCONFIRMED") {
+    if (c16Phase === "TRIGGERABLE") {
+      return "BUILDING";
+    }
+    return c16Phase;
+  }
+  return c16Phase;
+}
+
+// -----------------------------------------------------------------------
+// SCORE CALIBRATION — caps displayed sideClarity and triggerQuality
+// -----------------------------------------------------------------------
+function calibrateDisplayScores(
+  c16: C16Result,
+  mtf: MTFResult,
+  userStatus: UserStatus,
+): { sideClarity: number; triggerQuality: number } {
+  let { sideClarity, triggerQuality } = c16;
+
+  if (
+    mtf.confirm1h === "UNCONFIRMED" &&
+    mtf.bias4h !== "NEUTRAL" &&
+    (userStatus === "FORMING_SETUP" || userStatus === "WORTH_WATCHING")
+  ) {
+    sideClarity = Math.min(sideClarity, 55);
+    triggerQuality = Math.min(triggerQuality, 40);
+  }
+
+  if (
+    mtf.bias4h !== "NEUTRAL" &&
+    mtf.confirm1h !== "UNCONFIRMED" &&
+    mtf.growth15m < 25 &&
+    mtf.growth5m < 25 &&
+    (userStatus === "FORMING_SETUP" || userStatus === "WORTH_WATCHING")
+  ) {
+    triggerQuality = Math.min(triggerQuality, 35);
+  }
+
+  return { sideClarity, triggerQuality };
+}
+
+function resolveUserStatus(
+  c16: C16Result,
+  exec: ExecutionResult,
+  mtf: MTFResult,
+  safePhase: Phase,
+  tier: Tier,
+  hysteresis: HysteresisBuffer,
+): UserStatus {
+  // Terminal states bypass all promotion logic
+  if (exec.engineState === "ENTERED") return "ENTERED";
+  if (exec.engineState === "MANAGING") return "MANAGING";
+  if (exec.engineState === "EXITED") return "EXITED";
+  if (exec.engineState === "CANCELLED") return "CANCELLED";
+
+  let candidateStatus: UserStatus;
+
+  if (c16.side === "NEUTRAL" || c16.sideClarity < 50) {
+    candidateStatus = "DIRECTION_UNCLEAR";
+  } else if (
+    exec.displayMode === "EXACT_PLAN" &&
+    exec.entryAllowed &&
+    tier !== "LAYER_B"
+  ) {
+    candidateStatus = "READY";
+  } else if (
+    // FIX #1: Use safePhase instead of raw c16.phase for ARMED promotion check.
+    // Raw c16.phase can be TRIGGERABLE while safePhase is BUILDING (MTF cap applied).
+    // ARMED must only be assigned when MTF-confirmed phase justifies it.
+    exec.engineState === "ARMED" ||
+    (exec.entryAnchorResolved && safePhase === "TRIGGERABLE")
+  ) {
+    candidateStatus = "ARMED";
+  } else if (
+    // FIX #1 continued: use safePhase for ACTIVE_CANDIDATE too
+    safePhase === "TRIGGERABLE" ||
+    c16.tradeReadiness >= 60
+  ) {
+    candidateStatus = "ACTIVE_CANDIDATE";
+  } else if (safePhase === "PRESSURIZED" || c16.tradeReadiness >= 45) {
+    candidateStatus = "FORMING_SETUP";
+  } else if (safePhase === "BUILDING" || c16.tradeReadiness >= 30) {
+    candidateStatus = "WORTH_WATCHING";
+  } else {
+    candidateStatus = "EARLY_CANDIDATE";
+  }
+
+  // Apply MTF hierarchy cap — strict override
+  const mtfCap = resolveMTFStatusCap(mtf, tier);
+  if (mtfCap !== null) {
+    const capIdx = statusIndex(mtfCap);
+    const candidateIdx = statusIndex(candidateStatus);
+    if (candidateIdx > capIdx) {
+      candidateStatus = mtfCap;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // EXACT_PLAN / status consistency enforcement
+  // If execution resolver produced EXACT_PLAN, status must be at least ARMED.
+  // LAYER_B and DIRECTION_UNCLEAR are explicitly excluded from the floor.
+  // -----------------------------------------------------------------------
+  if (
+    exec.displayMode === "EXACT_PLAN" &&
+    tier !== "LAYER_B" &&
+    candidateStatus !== "DIRECTION_UNCLEAR"
+  ) {
+    const armedIdx = statusIndex("ARMED");
+    if (statusIndex(candidateStatus) < armedIdx) {
+      candidateStatus = "ARMED";
+    }
+  }
+
+  // Hysteresis: promotion requires 2 consecutive qualifying evaluations
+  const history = hysteresis.statusHistory;
+  const currentIdx = statusIndex(
+    history[history.length - 1] || "EARLY_CANDIDATE",
+  );
+  const candidateIdx = statusIndex(candidateStatus);
+
+  // Promotion: only if 2+ consecutive evals at new level
+  if (candidateIdx > currentIdx) {
+    const prevCandidate = history[history.length - 1];
+    if (prevCandidate !== candidateStatus) {
+      hysteresis.statusHistory = [...history.slice(-4), candidateStatus];
+      return history[history.length - 1] || candidateStatus;
+    }
+  }
+  // Demotion: immediate (1 cycle)
+  hysteresis.statusHistory = [...history.slice(-4), candidateStatus];
+  return candidateStatus;
+}
+
+function resolveBoardSection(
+  c16: C16Result,
+  context7d: Context7dResult,
+  exec: ExecutionResult,
+  mtf: MTFResult,
+  safePhase: Phase,
+  raw: RawSymbolData,
+  hysteresis: HysteresisBuffer,
+): BoardSection {
+  const staleness = Date.now() - raw.lastTickTime;
+  if (
+    !raw.wsConnected ||
+    staleness > 30000 ||
+    c16.phase === "DECAY" ||
+    c16.risk >= 70
+  ) {
+    return "WATCH_OUT";
+  }
+
+  // DIRECTION_UNCLEAR symbols must never appear in NOW or BREWING.
+  if (c16.side === "NEUTRAL" || c16.sideClarity < 50) {
+    hysteresis.boardSectionHistory = [
+      ...hysteresis.boardSectionHistory.slice(-3),
+      "WATCH_OUT",
+    ];
+    return "WATCH_OUT";
+  }
+
+  // FIX #2/#3: Board NOW uses safePhase, not raw c16.phase.
+  // safePhase is TRIGGERABLE only when MTF fully justifies it.
+  const isNow =
+    safePhase === "TRIGGERABLE" &&
+    exec.entryAllowed &&
+    c16.trust >= 65 &&
+    c16.sideClarity >= 50 &&
+    mtf.confirm1h !== "UNCONFIRMED" &&
+    mtf.bias4h !== "NEUTRAL" &&
+    c16.mainBlockers.length === 0 &&
+    exec.canShowExactExecutionPlan;
+
+  if (isNow) {
+    const prevSection =
+      hysteresis.boardSectionHistory[hysteresis.boardSectionHistory.length - 1];
+    if (prevSection !== "NOW") {
+      hysteresis.boardSectionHistory = [
+        ...hysteresis.boardSectionHistory.slice(-3),
+        "NOW",
+      ];
+      return prevSection || "BREWING";
+    }
+    hysteresis.boardSectionHistory = [
+      ...hysteresis.boardSectionHistory.slice(-3),
+      "NOW",
+    ];
+    return "NOW";
+  }
+
+  // FIX #2: SEVEN_DAY_BREWING check uses safePhase, not raw c16.phase.
+  if (
+    context7d.score >= 55 &&
+    safePhase !== "PRESSURIZED" &&
+    safePhase !== "TRIGGERABLE"
+  ) {
+    hysteresis.boardSectionHistory = [
+      ...hysteresis.boardSectionHistory.slice(-3),
+      "SEVEN_DAY_BREWING",
+    ];
+    return "SEVEN_DAY_BREWING";
+  }
+
+  hysteresis.boardSectionHistory = [
+    ...hysteresis.boardSectionHistory.slice(-3),
+    "BREWING",
+  ];
+  return "BREWING";
+}
+
+// FIX #4/#11: ARMED title is now "Long/Short Setup Armed" — distinct from ACTIVE_CANDIDATE
+function resolveTitle(
+  c16: C16Result,
+  mtf: MTFResult,
+  userStatus: UserStatus,
+): string {
+  if (c16.side === "NEUTRAL" || c16.sideClarity < 50)
+    return "Direction Unclear";
+
+  if (mtf.bias4h === "NEUTRAL") {
+    return c16.side === "LONG" ? "Long Bias Forming" : "Short Bias Forming";
+  }
+
+  const dir = c16.side === "LONG" ? "Long" : "Short";
+  switch (userStatus) {
+    case "READY":
+      return `${dir} Ready`;
+    case "ARMED":
+      // Spec §18: ARMED title must be distinct from ACTIVE_CANDIDATE
+      return `${dir} Setup Armed`;
+    case "ACTIVE_CANDIDATE":
+      return `Active ${dir} Candidate`;
+    case "FORMING_SETUP":
+      return `${dir} Bias Forming`;
+    case "WORTH_WATCHING":
+      return `Worth Watching ${dir}`;
+    case "EARLY_CANDIDATE":
+      return `${dir} Bias Forming`;
+    case "ENTERED":
+      return `${dir} — Entered`;
+    case "MANAGING":
+      return `${dir} — Managing`;
+    default:
+      return "Direction Unclear";
+  }
+}
+
+function resolveDoNow(
+  c16: C16Result,
+  exec: ExecutionResult,
+  mtf: MTFResult,
+  raw: RawSymbolData,
+  runtimeMode: RuntimeMode,
+): string {
+  const staleness = Date.now() - raw.lastTickTime;
+  // FIX #12: Do Now must reflect runtime degradation correctly
+  if (!raw.wsConnected || staleness > 60000) return "Offline — do not trade";
+  if (runtimeMode === "DEGRADED") return "Degraded — do not trade";
+  if (!raw.wsConnected || staleness > 30000)
+    return "Runtime partial — data unreliable, stand aside";
+  if (runtimeMode === "LIVE_PARTIAL")
+    return "Runtime partial — data unreliable, stand aside";
+  if (c16.trust < 65) return "Trust reduced — stand aside";
+  if (exec.displayMode === "EXACT_PLAN")
+    return "Entry conditions met — review now";
+  if (exec.displayMode === "LIVE_MANAGEMENT") return "Manage open position";
+  if (mtf.bias4h === "NEUTRAL") return "Watch for 4H directional structure";
+  if (mtf.confirm1h === "UNCONFIRMED") return "Watch for 1H confirmation";
+  if (c16.phase === "TRIGGERABLE") return "Wait for 1M gate to confirm";
+  if (c16.phase === "PRESSURIZED") return "Monitor for trigger formation";
+  if (c16.phase === "BUILDING") return "Monitor structure — setup building";
+  if (c16.phase === "DORMANT") return "No structural setup — background watch";
+  return "Background watch — no action yet";
+}
+
+function resolveRecentChange(
+  score: number,
+  exec: ExecutionResult,
+  c16: C16Result,
+  raw: RawSymbolData,
+  hysteresis: HysteresisBuffer,
+): string {
+  const staleness = Date.now() - raw.lastTickTime;
+  if (!raw.wsConnected || staleness > 30000) {
+    hysteresis.lastRecentChangeText = "Trust reduced";
+    hysteresis.anchorReported = false;
+    return "Trust reduced";
+  }
+  const delta = score - hysteresis.lastScoreForDelta;
+  hysteresis.lastScoreForDelta = score;
+
+  // FIX #13: Only report "Entry anchor resolved" once per new resolution event.
+  // Do not repeat it on every cycle. Once reported, stay at that text until
+  // the anchor is lost or something else changes.
+  if (exec.entryAnchorResolved && exec.entryClass !== "NONE") {
+    if (!hysteresis.anchorReported) {
+      hysteresis.anchorReported = true;
+      hysteresis.lastRecentChangeText = "Entry anchor resolved";
+      return "Entry anchor resolved";
+    }
+    // Already reported — fall through to normal delta logic
+  } else if (exec.entryAnchorResolved && exec.entryClass === "NONE") {
+    if (!hysteresis.anchorReported) {
+      hysteresis.anchorReported = true;
+      hysteresis.lastRecentChangeText = "Entry zone forming — class unresolved";
+      return "Entry zone forming — class unresolved";
+    }
+  } else {
+    // Anchor lost — reset the flag
+    hysteresis.anchorReported = false;
+  }
+
+  if (delta > 5) {
+    const text = "Pressure improving";
+    hysteresis.lastRecentChangeText = text;
+    return text;
+  }
+  if (delta < -5) {
+    const text =
+      c16.phase === "DECAY" ? "Trigger weakening" : "Setup weakening";
+    hysteresis.lastRecentChangeText = text;
+    return text;
+  }
+  if (c16.phase === "TRIGGERABLE") {
+    return "Setup holding";
+  }
+  return hysteresis.lastRecentChangeText || "No meaningful change";
+}
+
+function resolveTier(c16: C16Result, context7d: Context7dResult): Tier {
+  if (context7d.score >= 60 && c16.tradeReadiness >= 45 && c16.trust >= 60) {
+    return "PRIORITY_CORE";
+  }
+  return "LAYER_B";
+}
+
+function resolveRuntimeMode(raw: RawSymbolData): RuntimeMode {
+  const staleness = Date.now() - raw.lastTickTime;
+  if (!raw.wsConnected && staleness > 60000) return "OFFLINE";
+  if (!raw.wsConnected) return "DEGRADED";
+  if (staleness > 30000) return "LIVE_PARTIAL";
+  if (raw.dataQuality < 70) return "LIVE_PARTIAL";
+  return "LIVE";
+}
+
+// -----------------------------------------------------------------------
+// Next promotion target — respects MTF blocker hierarchy
+// -----------------------------------------------------------------------
+function resolveNextPromotionTarget(
+  userStatus: UserStatus,
+  mtf: MTFResult,
+  tier: Tier,
+  mainBlocker: string | null,
+): string | null {
+  if (userStatus === "DIRECTION_UNCLEAR") {
+    return "Establish directional side clarity >= 50 on 4H";
+  }
+
+  if (
+    userStatus === "EARLY_CANDIDATE" ||
+    userStatus === "WORTH_WATCHING" ||
+    userStatus === "FORMING_SETUP" ||
+    userStatus === "ACTIVE_CANDIDATE" ||
+    userStatus === "ARMED"
+  ) {
+    if (mtf.bias4h === "NEUTRAL") {
+      return "Wait for 4H directional bias to form";
+    }
+    if (mtf.confirm1h === "UNCONFIRMED") {
+      // FIX #15: Suppress if substantially duplicates mainBlocker
+      const next = "1H confirmation needed — wait for 1H to align with 4H bias";
+      if (
+        mainBlocker?.toLowerCase().includes("1h") &&
+        mainBlocker.toLowerCase().includes("miss")
+      ) {
+        return null; // mainBlocker already says this
+      }
+      return next;
+    }
+    const both15m5mWeak = mtf.growth15m < 25 && mtf.growth5m < 25;
+    if (both15m5mWeak) {
+      return "15M/5M pressure must build";
+    }
+    if (tier === "LAYER_B") {
+      return "Promote to Priority Core for execution depth";
+    }
+    if (userStatus === "ARMED") {
+      return "ARMED — wait for 1M gate to confirm entry timing";
+    }
+    if (userStatus === "ACTIVE_CANDIDATE") {
+      return "Resolve entry anchor to reach ARMED";
+    }
+    if (userStatus === "FORMING_SETUP") {
+      return "Active Candidate — build to PRESSURIZED phase";
+    }
+    if (userStatus === "WORTH_WATCHING") {
+      return "Forming Setup — improve trade readiness >= 45";
+    }
+    return "Worth Watching — improve side clarity >= 50";
+  }
+  return null;
+}
+
+// -----------------------------------------------------------------------
+// DEDUPLICATION HELPER
+// -----------------------------------------------------------------------
+export function resolveActionContext(
+  doNow: string,
+  nextPromotionTarget: string | null,
+  activationCondition: string,
+): { doNow: string; nextStep: string | null; activation: string | null } {
+  const norm = (s: string) => s.toLowerCase().trim();
+
+  const doNowN = norm(doNow);
+  const nextN = nextPromotionTarget ? norm(nextPromotionTarget) : null;
+  const activN = norm(activationCondition);
+
+  if (activN === doNowN && (nextN === null || nextN === doNowN)) {
+    return { doNow, nextStep: null, activation: null };
+  }
+
+  const activation = activN !== doNowN ? activationCondition : null;
+
+  const nextStep =
+    nextN !== null &&
+    nextN !== doNowN &&
+    nextN !== (activation ? norm(activation) : null)
+      ? nextPromotionTarget
+      : null;
+
+  return { doNow, nextStep, activation };
+}
+
+export function mergeCanonicalState(
+  raw: RawSymbolData,
+  c16: C16Result,
+  context7d: Context7dResult,
+  mtf: MTFResult,
+  exec: ExecutionResult,
+): CanonicalSymbolState {
+  const hysteresis = getHysteresis(raw.symbol);
+  const runtimeMode = resolveRuntimeMode(raw);
+  const tier = resolveTier(c16, context7d);
+  const staleness = Date.now() - raw.lastTickTime;
+  const stale = staleness > 30000;
+  const degraded = !raw.wsConnected || raw.dataQuality < 70;
+  const trustScore = c16.trust;
+  const runtimeHealthy = runtimeMode === "LIVE";
+
+  // safePhase must be computed BEFORE resolveUserStatus — it is used there
+  const safePhase = resolveSafePhase(c16.phase, mtf);
+
+  // FIX #1: Pass safePhase into resolveUserStatus so ARMED/ACTIVE_CANDIDATE checks
+  // use MTF-capped phase, not raw c16.phase.
+  const userStatus = resolveUserStatus(
+    c16,
+    exec,
+    mtf,
+    safePhase,
+    tier,
+    hysteresis,
+  );
+
+  // FIX #2/#3: Pass safePhase into resolveBoardSection for NOW/SEVEN_DAY_BREWING checks.
+  const boardSection = resolveBoardSection(
+    c16,
+    context7d,
+    exec,
+    mtf,
+    safePhase,
+    raw,
+    hysteresis,
+  );
+  const title = resolveTitle(c16, mtf, userStatus);
+  const doNow = resolveDoNow(c16, exec, mtf, raw, runtimeMode);
+  const recentChangeText = resolveRecentChange(
+    c16.score,
+    exec,
+    c16,
+    raw,
+    hysteresis,
+  );
+
+  let mainBlocker: string | null = null;
+  if (mtf.bias4h === "NEUTRAL") {
+    mainBlocker = "4H bias neutral — no directional structure";
+  } else if (mtf.confirm1h === "UNCONFIRMED") {
+    mainBlocker = "1H confirmation missing";
+  } else {
+    mainBlocker =
+      c16.mainBlockers[0] ||
+      mtf.mainExecutionBlocker ||
+      exec.mainExecutionBlocker ||
+      null;
+  }
+
+  const secondaryBlocker = c16.secondaryBlockers[0] || null;
+  // FIX #15: Pass mainBlocker to suppress duplicate nextPromotionTarget
+  const nextPromotionTarget = resolveNextPromotionTarget(
+    userStatus,
+    mtf,
+    tier,
+    mainBlocker,
+  );
+
+  // LAYER_B displayMode guard
+  const safeDisplayMode =
+    tier === "LAYER_B" && exec.displayMode === "EXACT_PLAN"
+      ? ("PROVISIONAL_PLAN" as const)
+      : exec.displayMode;
+  const safeCanShowExact =
+    tier === "LAYER_B" ? false : exec.canShowExactExecutionPlan;
+
+  // SCORE CALIBRATION
+  const displayScores = calibrateDisplayScores(c16, mtf, userStatus);
+
+  const spread =
+    raw.lastPrice > 0
+      ? ((raw.askPrice - raw.bidPrice) / raw.lastPrice) * 100
+      : 0;
+
+  return {
+    symbol: raw.symbol,
+    lastUpdated: Date.now(),
+
+    health: {
+      tier,
+      runtimeMode,
+      trustScore,
+      degraded,
+      stale,
+      runtimeHealthy,
+      syncQuality: raw.dataQuality,
+      dataQuality: raw.dataQuality,
+    },
+
+    context7d: {
+      score: context7d.score,
+      accumulation: context7d.accumulation,
+      tension: context7d.tension,
+      priceHold: context7d.priceHold,
+      twoWayFlow: context7d.twoWayFlow,
+      releasePotential: context7d.releasePotential,
+      stage: context7d.stage,
+      supportsLong: context7d.supportsLong,
+      supportsShort: context7d.supportsShort,
+      tags: context7d.tags,
+      continuationState: context7d.continuationState,
+    },
+
+    c16: {
+      side: c16.side,
+      phase: c16.phase, // raw internal phase — use ui.safePhase for display
+      score: c16.score,
+      tradeReadiness: c16.tradeReadiness,
+      sideClarity: displayScores.sideClarity,
+      triggerQuality: displayScores.triggerQuality,
+      executionQuality: c16.executionQuality,
+      risk: c16.risk,
+      trust: c16.trust,
+      mainBlockers: c16.mainBlockers,
+      secondaryBlockers: c16.secondaryBlockers,
+      tertiaryBlockers: c16.tertiaryBlockers,
+    },
+
+    mtf: {
+      bias4h: mtf.bias4h,
+      confirm1h: mtf.confirm1h,
+      growth15m: mtf.growth15m,
+      growth5m: mtf.growth5m,
+      gate1mLong: mtf.gate1mLong,
+      gate1mShort: mtf.gate1mShort,
+      breakoutConfidenceLong: mtf.breakoutConfidenceLong,
+      breakoutConfidenceShort: mtf.breakoutConfidenceShort,
+      reversalConfidenceLong: mtf.reversalConfidenceLong,
+      reversalConfidenceShort: mtf.reversalConfidenceShort,
+      entryAllowed: mtf.entryAllowed,
+      mainExecutionBlocker: mtf.mainExecutionBlocker,
+    },
+
+    execution: {
+      executionSide: exec.executionSide,
+      engineState: exec.engineState,
+      displayMode: safeDisplayMode,
+      entryClass: exec.entryClass,
+      entryAllowed: exec.entryAllowed,
+      canShowExactExecutionPlan: safeCanShowExact,
+      entryAnchorResolved: exec.entryAnchorResolved,
+      exactEntryPrice: exec.exactEntryPrice,
+      exactStopLoss: exec.exactStopLoss,
+      exactInvalidationPrice: exec.exactInvalidationPrice,
+      tp1: exec.tp1,
+      tp2: exec.tp2,
+      tp3: exec.tp3,
+      rr1: exec.rr1,
+      rr2: exec.rr2,
+      rr3: exec.rr3,
+      entryConfidence: exec.entryConfidence,
+      executionModeLabel: exec.executionModeLabel,
+      mainExecutionBlocker: exec.mainExecutionBlocker,
+      executionReasoning: exec.executionReasoning,
+      executionWarnings: exec.executionWarnings,
+    },
+
+    ui: {
+      userFacingStatus: userStatus,
+      title,
+      subtitle: `${safePhase} — Score ${c16.score.toFixed(0)}`,
+      safePhase,
+      directionLabel: c16.side,
+      boardSection,
+      mainBlocker,
+      secondaryBlocker,
+      nextPromotionTarget,
+      recentChangeText,
+      doNow,
+    },
+
+    price: {
+      last: raw.lastPrice,
+      bid: raw.bidPrice,
+      ask: raw.askPrice,
+      change24h: raw.priceChangePercent,
+      volume24h: raw.volume,
+      high24h: raw.highPrice,
+      low24h: raw.lowPrice,
+      spreadPct: spread,
+    },
+
+    klines: {
+      tf4h: raw.klines4h,
+      tf1h: raw.klines1h,
+      tf15m: raw.klines15m,
+      tf5m: raw.klines5m,
+      tf1m: raw.klines1m,
+    },
+  };
+}
