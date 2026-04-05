@@ -1,5 +1,7 @@
 import { ExecutionTag, SideBadge } from "../components/SharedComponents";
 import { SymbolRow } from "../components/SymbolRow";
+import { WatchSyncIndicator } from "../components/WatchSyncIndicator";
+import type { RuntimeStatus } from "../engine/binanceRuntime";
 import type { CanonicalSymbolState } from "../engine/types";
 
 interface WatchlistScreenProps {
@@ -7,11 +9,12 @@ interface WatchlistScreenProps {
   symbolStates: Map<string, CanonicalSymbolState>;
   onSelectSymbol: (symbol: string) => void;
   onRemoveFromWatchlist: (symbol: string) => void;
+  runtimeStatus: RuntimeStatus;
 }
 
 const BACKGROUND_WATCH_PLACEHOLDER = "Background watch — no action yet";
 
-// FIX #15: Suppress nextPromotionTarget in sub-row if it substantially
+// Suppress nextPromotionTarget in sub-row if it substantially
 // duplicates the mainBlocker (same timeframe and same concept).
 function shouldShowNextTarget(
   nextTarget: string | null,
@@ -21,9 +24,7 @@ function shouldShowNextTarget(
   if (!mainBlocker) return true;
   const n = nextTarget.toLowerCase();
   const b = mainBlocker.toLowerCase();
-  // If both mention 4H and neutral/directional → duplicate
   if (n.includes("4h") && b.includes("4h")) return false;
-  // If both mention 1H confirmation → duplicate
   if (
     n.includes("1h") &&
     b.includes("1h") &&
@@ -39,6 +40,7 @@ export function WatchlistScreen({
   symbolStates,
   onSelectSymbol,
   onRemoveFromWatchlist,
+  runtimeStatus,
 }: WatchlistScreenProps) {
   const watchlistStates = watchlist
     .map((sym) => symbolStates.get(sym))
@@ -46,14 +48,18 @@ export function WatchlistScreen({
 
   return (
     <div className="flex flex-col h-full" data-ocid="watchlist.page">
-      {/* Header */}
+      {/* Header — symbol count + live sync indicator */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-surface-border">
-        <h2 className="text-sm font-sans font-semibold text-foreground">
-          Watchlist
-        </h2>
-        <span className="text-[10px] font-mono text-muted-foreground">
-          {watchlist.length} symbols
-        </span>
+        <div className="flex items-center gap-2">
+          <h2 className="text-sm font-sans font-semibold text-foreground">
+            Watchlist
+          </h2>
+          <span className="text-[10px] font-mono text-muted-foreground">
+            {watchlist.length} symbols
+          </span>
+        </div>
+        {/* Sync indicator — reads from canonical runtimeStatus, no fake polling */}
+        <WatchSyncIndicator runtimeStatus={runtimeStatus} />
       </div>
 
       <div className="flex-1 overflow-y-auto">

@@ -66,6 +66,7 @@ export default function App() {
             symbolStates={symbolStates}
             onSelectSymbol={handleSelectSymbol}
             onRemoveFromWatchlist={removeFromWatchlist}
+            runtimeStatus={runtimeStatus}
           />
         )}
         {activeTab === "screener" && (
